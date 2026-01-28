@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+Lenny's Podcast Transcript Ingestion Script - UPDATED VERSION
+Handles multiple transcript formats and timestamp styles
+"""
+
+import os
+import re
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+import chromadb
+from chromadb.config import Settings
+from openai import OpenAI
+from dotenv import load_dotenv
+import tiktoken
+
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize tokenizer for counting tokens
+encoding = tiktoken.get_encoding("cl100k_base")
+
+# Configuration
+TRANSCRIPTS_DIR = "./transcripts"
+DATABASE_DIR = "/Users/aryan/Documents/lenny-mcp-server/database"
+CHUNK_SIZE = 800  # Target tokens per chunk
+OVERLAP = 100     # Overlap between chunks to maintain context
+
+def count_tokens(text: str) -> int:
+    """Count the number of tokens in a text string."""
+    return len(encoding.encode(text))
+
+def normalize_timestamp(timestamp: str) -> str:
+    """
+    Normalize timestamps to HH:MM:SS format.
+    Handles both HH:MM:SS and MM:SS formats.
+    """
+    parts = timestamp.split(':')
+    if len(parts) == 2:
+        # MM:SS format - add hours
+        return f"00:{parts[0].zfill(2)}:{parts[1].zfill(2)}"
+    elif len(parts) == 3:
+        # HH:MM:SS format - ensure zero padding
+        return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
+    else:
+        # Invalid format, return as-is
+        return timestamp
+
+def parse_transcript(file_path: str) -> Tuple[str, List[Dict]]:
+    """
+    Parse a transcript file and extract structured data.
+    Handles multiple formats:
+    1. Speaker Name (HH:MM:SS): or Speaker Name (MM:SS):
+    2. [HH:MM:SS] Speaker Name: or [MM:SS] Speaker Name:
+    
+    Returns:
+        Tuple of (guest_name, list of parsed segments)
+    """
+    # Extract guest name from filename
+    guest_name = Path(file_path).stem
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Define multiple patterns to try
+    patterns = [
+        # Pattern 1: Speaker Name (HH:MM:SS): or (MM:SS):
+        r'^([^(\[]+?)\s*\((\d{1,2}:\d{2}(?::\d{2})?)\):',
+        # Pattern 2: [HH:MM:SS] Speaker Name: or [MM:SS] Speaker Name:
+        r'^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*([^:]+):',
+    ]
+    
+    segments = []
+    lines = content.split('\n')
+    current_speaker = None
+    current_timestamp = None
+    current_text = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Try each pattern
+        matched = False
+        for pattern_idx, pattern in enumerate(patterns):
+            match = re.match(pattern, line)
+            if match:
+                # Save previous segment if exists
+                if current_speaker and current_text:
+                    segments.append({
+                        'speaker': current_speaker.strip(),
+                        'timestamp': normalize_timestamp(current_timestamp),
+                        'text': ' '.join(current_text)
+                    })
+                
+                # Extract speaker and timestamp based on pattern
+                if pattern_idx == 0:
+                    # Pattern 1: Name (timestamp):
+                    current_speaker = match.group(1)
+                    current_timestamp = match.group(2)
+                else:
+                    # Pattern 2: [timestamp] Name:
+                    current_timestamp = match.group(1)
+                    current_speaker = match.group(2)
+                
+                current_text = []
+                matched = True
+                break
+        
+        if not matched and current_speaker:
+            # This is content, add to current segment
+            current_text.append(line)
+    
+    # Don't forget the last segment
+    if current_speaker and current_text:
+        segments.append({
+            'speaker': current_speaker.strip(),
+            'timestamp': normalize_timestamp(current_timestamp),
+            'text': ' '.join(current_text)
+        })
+    
+    return guest_name, segments
+
+def create_chunks(segments: List[Dict], guest_name: str) -> List[Dict]:
+    """
+    Create chunks from segments, aiming for CHUNK_SIZE tokens each.
+    """
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+    chunk_start_timestamp = None
+    
+    for segment in segments:
+        segment_text = f"{segment['speaker']}: {segment['text']}"
+        segment_tokens = count_tokens(segment_text)
+        
+        # If this segment alone is larger than chunk size, split it
+        if segment_tokens > CHUNK_SIZE:
+            # Save current chunk if it exists
+            if current_chunk:
+                chunks.append({
+                    'text': '\n\n'.join(current_chunk),
+                    'guest_name': guest_name,
+                    'start_timestamp': chunk_start_timestamp,
+                    'tokens': current_tokens
+                })
+                current_chunk = []
+                current_tokens = 0
+            
+            # Split large segment into multiple chunks
+            words = segment_text.split()
+            temp_chunk = []
+            temp_tokens = 0
+            
+            for word in words:
+                word_tokens = count_tokens(word + " ")
+                if temp_tokens + word_tokens > CHUNK_SIZE and temp_chunk:
+                    chunks.append({
+                        'text': ' '.join(temp_chunk),
+                        'guest_name': guest_name,
+                        'start_timestamp': segment['timestamp'],
+                        'tokens': temp_tokens
+                    })
+                    temp_chunk = []
+                    temp_tokens = 0
+                
+                temp_chunk.append(word)
+                temp_tokens += word_tokens
+            
+            if temp_chunk:
+                current_chunk = [' '.join(temp_chunk)]
+                current_tokens = temp_tokens
+                chunk_start_timestamp = segment['timestamp']
+        
+        # Check if adding this segment would exceed chunk size
+        elif current_tokens + segment_tokens > CHUNK_SIZE and current_chunk:
+            # Save current chunk
+            chunks.append({
+                'text': '\n\n'.join(current_chunk),
+                'guest_name': guest_name,
+                'start_timestamp': chunk_start_timestamp,
+                'tokens': current_tokens
+            })
+            
+            # Start new chunk with this segment
+            current_chunk = [segment_text]
+            current_tokens = segment_tokens
+            chunk_start_timestamp = segment['timestamp']
+        else:
+            # Add to current chunk
+            if not current_chunk:
+                chunk_start_timestamp = segment['timestamp']
+            current_chunk.append(segment_text)
+            current_tokens += segment_tokens
+    
+    # Don't forget the last chunk
+    if current_chunk:
+        chunks.append({
+            'text': '\n\n'.join(current_chunk),
+            'guest_name': guest_name,
+            'start_timestamp': chunk_start_timestamp,
+            'tokens': current_tokens
+        })
+    
+    return chunks
+
+def generate_embeddings(texts: List[str]) -> List[List[float]]:
+    """
+    Generate embeddings using OpenAI's API.
+    Processes in batches to handle rate limits.
+    """
+    batch_size = 100
+    all_embeddings = []
+    
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        print(f"  Generating embeddings for batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1}")
+        
+        response = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=batch
+        )
+        
+        batch_embeddings = [item.embedding for item in response.data]
+        all_embeddings.extend(batch_embeddings)
+    
+    return all_embeddings
+
+def get_failed_files() -> List[str]:
+    """
+    Returns a list of files that previously failed (had 0 segments).
+    Based on your ingestion output.
+    """
+    failed_guests = [
+        "Ryan Hoover", "Gibson Biddle", "Jackie Bavaro", "Upasna Gautam",
+        "Adriel Frederick", "Keith Yandell", "Marily Nika", "Kristen Berman",
+        "Dylan Field", "Asha Sharma", "Casey Winters", "Melissa", "Naomi Ionita",
+        "Ayo Omojola", "Marc Benioff", "Matt Dixon", "Teresa Torres", "Merci Grace",
+        "Seth Godin", "Inbal S", "Vijay", "Shweta Shriva", "Barbra Gago",
+        "Brandon Chu", "Marty Cagan", "Wes Kao", "Shreyas Doshi Live",
+        "Interview Q Compilation", "Janna Bastow", "Teaser_2021", "Nikita Miller",
+        "Julian Shapiro"
+    ]
+    return [f + ".txt" for f in failed_guests]
+
+def main(only_failed: bool = False):
+    """Main ingestion process."""
+    print("=" * 60)
+    print("Lenny's Podcast Transcript Ingestion - UPDATED")
+    print("=" * 60)
+    
+    # Initialize Chroma client
+    print("\n1. Initializing database...")
+    client = chromadb.PersistentClient(path=DATABASE_DIR)
+    
+    # Get or create collection
+    try:
+        collection = client.get_collection(name="lenny_transcripts")
+        print("   Found existing collection.")
+        if not only_failed:
+            print("   Deleting to rebuild...")
+            client.delete_collection(name="lenny_transcripts")
+            collection = client.create_collection(
+                name="lenny_transcripts",
+                metadata={"description": "Lenny's Podcast transcripts with OpenAI embeddings"}
+            )
+    except:
+        collection = client.create_collection(
+            name="lenny_transcripts",
+            metadata={"description": "Lenny's Podcast transcripts with OpenAI embeddings"}
+        )
+    
+    print("   Collection ready.")
+    
+    # Get all transcript files
+    print("\n2. Finding transcript files...")
+    
+    if only_failed:
+        failed_files = get_failed_files()
+        transcript_files = [
+            Path(TRANSCRIPTS_DIR) / f 
+            for f in failed_files 
+            if (Path(TRANSCRIPTS_DIR) / f).exists()
+        ]
+        print(f"   Processing {len(transcript_files)} previously failed files.")
+    else:
+        transcript_files = list(Path(TRANSCRIPTS_DIR).glob("*.txt"))
+        print(f"   Found {len(transcript_files)} transcript files.")
+    
+    if len(transcript_files) == 0:
+        print("\n   ERROR: No transcript files found!")
+        print(f"   Please ensure .txt files are in: {TRANSCRIPTS_DIR}")
+        return
+    
+    # Process each transcript
+    print("\n3. Processing transcripts...")
+    all_chunks = []
+    success_count = 0
+    fail_count = 0
+    
+    for idx, file_path in enumerate(transcript_files, 1):
+        print(f"\n   [{idx}/{len(transcript_files)}] Processing: {file_path.name}")
+        
+        try:
+            # Parse transcript
+            guest_name, segments = parse_transcript(str(file_path))
+            print(f"      Guest: {guest_name}")
+            print(f"      Segments: {len(segments)}")
+            
+            if len(segments) == 0:
+                print(f"      ⚠️  WARNING: No segments parsed! Skipping.")
+                fail_count += 1
+                continue
+            
+            # Create chunks
+            chunks = create_chunks(segments, guest_name)
+            print(f"      Chunks created: {len(chunks)}")
+            
+            # Add file reference to each chunk
+            for chunk in chunks:
+                chunk['file_name'] = file_path.name
+            
+            all_chunks.extend(chunks)
+            success_count += 1
+            
+        except Exception as e:
+            print(f"      ❌ ERROR processing {file_path.name}: {str(e)}")
+            fail_count += 1
+            continue
+    
+    print(f"\n   Total chunks created: {len(all_chunks)}")
+    print(f"   Success: {success_count} files")
+    print(f"   Failed: {fail_count} files")
+    
+    if len(all_chunks) == 0:
+        print("\n   No chunks to process. Exiting.")
+        return
+    
+    # Generate embeddings
+    print("\n4. Generating embeddings with OpenAI...")
+    texts = [chunk['text'] for chunk in all_chunks]
+    embeddings = generate_embeddings(texts)
+    print(f"   Generated {len(embeddings)} embeddings.")
+    
+    # Store in database
+    print("\n5. Storing in database...")
+    
+    # Get current max ID to avoid conflicts
+    try:
+        existing = collection.get()
+        if existing['ids']:
+            max_id = max([int(id.split('_')[1]) for id in existing['ids']])
+            start_id = max_id + 1
+        else:
+            start_id = 0
+    except:
+        start_id = 0
+    
+    ids = [f"chunk_{start_id + i}" for i in range(len(all_chunks))]
+    metadatas = [
+        {
+            'guest_name': chunk['guest_name'],
+            'timestamp': chunk['start_timestamp'],
+            'file_name': chunk['file_name'],
+            'tokens': chunk['tokens']
+        }
+        for chunk in all_chunks
+    ]
+    
+    # Add to collection in batches
+    batch_size = 500
+    for i in range(0, len(all_chunks), batch_size):
+        end_idx = min(i + batch_size, len(all_chunks))
+        print(f"   Storing batch {i//batch_size + 1}/{(len(all_chunks)-1)//batch_size + 1}")
+        
+        collection.add(
+            ids=ids[i:end_idx],
+            embeddings=embeddings[i:end_idx],
+            documents=texts[i:end_idx],
+            metadatas=metadatas[i:end_idx]
+        )
+    
+    print("\n" + "=" * 60)
+    print("✓ Ingestion Complete!")
+    print("=" * 60)
+    print(f"Episodes processed: {len(transcript_files)}")
+    print(f"Successful: {success_count}")
+    print(f"Failed: {fail_count}")
+    print(f"Total chunks stored: {len(all_chunks)}")
+    print(f"Database location: {DATABASE_DIR}")
+    
+    if fail_count > 0:
+        print(f"\n⚠️  {fail_count} files still failed. These might need manual inspection.")
+
+if __name__ == "__main__":
+    import sys
+    
+    # Check if --only-failed flag is provided
+    only_failed = "--only-failed" in sys.argv
+    
+    if only_failed:
+        print("\nProcessing ONLY previously failed files...\n")
+    
+    main(only_failed=only_failed)
